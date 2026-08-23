@@ -20,6 +20,22 @@ backups/
 snapshots/
 tunnels/
 
+# Security: sensitive files
+secrets.json
+config.json
+*.key
+*.pem
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+id_dsa
+id_dsa.*
+*.p12
+*.pfx
+
 # Windows
 Thumbs.db
 desktop.ini
