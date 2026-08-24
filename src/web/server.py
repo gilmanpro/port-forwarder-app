@@ -7,6 +7,9 @@ Endpoints:
   GET  /api/v1/alerts         -> alertas abiertas/recientes
   GET  /api/v1/health         -> health check (M3)
   GET  /api/v1/vps            -> VPS registrados
+  GET  /api/v1/distros        -> lista distros WSL
+  GET  /api/v1/distro/<name>/export -> exportar distro (descarga tar)
+  POST /api/v1/distro/import  -> importar distro (subida tar)
   POST /api/v1/forwards/apply -> reaplicar forwards (F2)
   POST /api/v1/forwards/clear -> limpiar todos (F3, destructivo)
   POST /api/v1/forwards/add   -> crear forward (F1)
@@ -96,9 +99,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         referer = self.headers.get("Referer")
         if referer:
             return self._same_origin(referer)
-        # Sin Origin ni Referer no es un navegador: rechazar mutaciones.
-        # Scripts (curl) deben enviar 'Origin: http://<host>:<puerto>'.
-        return False
+        # Sin Origin ni Referer no es un navegador (curl/script/API):
+        # no hay riesgo de CSRF, permitir (la auth Bearer sigue obligatoria).
+        return True
 
     def _authed(self) -> bool:
         token = self.panel.token
@@ -140,6 +143,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._send(*_json(self.panel.health()))
             elif path == "/api/v1/vps":
                 self._send(*_json(self.panel.vps_list()))
+            elif path == "/api/v1/distros":
+                self._send(*_json(self.panel.distros_list()))
+            elif path.startswith("/api/v1/distro/") and path.endswith("/export"):
+                parts = [p for p in path.split("/") if p]
+                if len(parts) == 5 and parts[3] != "import":
+                    self._handle_export(parts[3])
+                else:
+                    self._deny(404, "no encontrado")
             else:
                 self._deny(404, "no encontrado")
         except Exception as e:
@@ -159,6 +170,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not self._authed():
             self._deny()
             return
+
+        # Import distro (multipart upload)
+        if path == "/api/v1/distro/import":
+            self._handle_import()
+            return
+
         body: dict[str, Any] = {}
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -176,6 +193,145 @@ class PanelHandler(BaseHTTPRequestHandler):
             log.exception("POST %s fallo", path)
             body, _ = _json({"ok": False, "error": str(e)})
             self._send(body, 500)
+
+    def _handle_export(self, name: str) -> None:
+        """Stream wsl --export as a tar download."""
+        import subprocess
+        import tempfile
+        import os
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        try:
+            proc = subprocess.run(
+                ["wsl.exe", "--export", name, tmp_path],
+                capture_output=True, timeout=600,
+                creationflags=0x08000000
+            )
+            if proc.returncode != 0:
+                error = proc.stderr.decode("utf-8", errors="replace").strip()
+                if not error:
+                    error = proc.stdout.decode("utf-8", errors="replace").strip()
+                self._send(*_json({"ok": False, "error": f"export fallo: {error}"}))
+                return
+
+            file_size = os.path.getsize(tmp_path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-tar")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}.tar"')
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+            with open(tmp_path, "rb") as f:
+                while chunk := f.read(65536):
+                    self.wfile.write(chunk)
+
+        except subprocess.TimeoutExpired:
+            self._send(*_json({"ok": False, "error": "export timeout (600s)"}))
+        except Exception as e:
+            self._send(*_json({"ok": False, "error": str(e)}))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _handle_import(self) -> None:
+        """Handle multipart tar upload and wsl --import."""
+        import subprocess
+        import tempfile
+        import os
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self._send(*_json({"ok": False, "error": "Content-Type debe ser multipart/form-data"}))
+            return
+
+        boundary = None
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part[9:].strip().strip('"')
+                break
+        if not boundary:
+            self._send(*_json({"ok": False, "error": "boundary no encontrado"}))
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            self._send(*_json({"ok": False, "error": "Content-Length requerido"}))
+            return
+        if content_length > 10 * 1024 * 1024 * 1024:  # 10GB max
+            self._send(*_json({"ok": False, "error": "archivo demasiado grande (max 10GB)"}))
+            return
+
+        raw = self.rfile.read(content_length)
+        boundary_bytes = f"--{boundary}".encode()
+        parts = raw.split(boundary_bytes)
+
+        name = None
+        install_dir = None
+        tar_data = None
+
+        for part in parts:
+            if b"Content-Disposition" not in part:
+                continue
+            header_end = part.find(b"\r\n\r\n")
+            if header_end == -1:
+                continue
+            headers_raw = part[:header_end].decode("utf-8", errors="replace")
+            body_raw = part[header_end + 4:]
+            if body_raw.endswith(b"\r\n"):
+                body_raw = body_raw[:-2]
+
+            if 'name="name"' in headers_raw:
+                name = body_raw.decode("utf-8", errors="replace").strip()
+            elif 'name="install_dir"' in headers_raw:
+                install_dir = body_raw.decode("utf-8", errors="replace").strip()
+            elif 'name="file"' in headers_raw:
+                tar_data = body_raw
+
+        if not name:
+            self._send(*_json({"ok": False, "error": "name requerido"}))
+            return
+        if not tar_data:
+            self._send(*_json({"ok": False, "error": "file (tar) requerido"}))
+            return
+        if not install_dir:
+            install_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "WSL", name)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+        tmp_path = tmp.name
+        tmp.write(tar_data)
+        tmp.close()
+
+        try:
+            proc = subprocess.run(
+                ["wsl.exe", "--import", name, install_dir, tmp_path],
+                capture_output=True, timeout=600,
+                creationflags=0x08000000
+            )
+            if proc.returncode != 0:
+                error = proc.stderr.decode("utf-8", errors="replace").strip()
+                if not error:
+                    error = proc.stdout.decode("utf-8", errors="replace").strip()
+                self._send(*_json({"ok": False, "error": f"import fallo: {error}"}))
+                return
+
+            self._send(*_json({"ok": True, "message": f"distro '{name}' importada"}))
+
+        except subprocess.TimeoutExpired:
+            self._send(*_json({"ok": False, "error": "import timeout (600s)"}))
+        except Exception as e:
+            self._send(*_json({"ok": False, "error": str(e)}))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 class WebPanel:
@@ -314,6 +470,37 @@ class WebPanel:
                 for v in self.supervisor.store.cfg.vps_list
             ],
         }
+
+    def distros_list(self) -> dict[str, Any]:
+        """Lista distros WSL via wsl.exe -l -v (sin deteccion de IP: evita colgar)."""
+        distros = []
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["wsl.exe", "--list", "--verbose"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=0x08000000,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line or "NAME" in line.upper() or "---" in line:
+                        continue
+                    parts = [p for p in line.split() if p]
+                    if len(parts) >= 3:
+                        name, state, ver = parts[0], parts[1], parts[2]
+                    elif len(parts) == 2:
+                        name, state, ver = parts[0], parts[1], "?"
+                    else:
+                        continue
+                    distros.append({
+                        "name": name, "state": state,
+                        "version": ver, "ip": None,
+                        "running": state.lower() == "running",
+                    })
+        except Exception:
+            pass
+        return {"ok": True, "distros": distros}
 
     # -- acciones -------------------------------------------------------------------
 

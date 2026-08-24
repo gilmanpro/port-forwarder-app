@@ -256,12 +256,13 @@ class McpServer:
         n_tools = len(r["result"]["tools"]) if r else 0
         results.append({"step": "tools/list", "ok": n_tools > 0,
                         "tools": n_tools})
+        args = {"token": self.token} if self.token else {}
         r = self.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                         "params": {"name": "status", "arguments": {}}})
+                         "params": {"name": "status", "arguments": args}})
         results.append({"step": "tools/call status", "ok": r is not None
                         and "result" in r})
         r = self.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                         "params": {"name": "no-existe", "arguments": {}}})
+                         "params": {"name": "no-existe", "arguments": args}})
         results.append({"step": "tool desconocida", "ok": r is not None
                         and "error" in r})
         return results
