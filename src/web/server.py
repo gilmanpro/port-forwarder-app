@@ -478,7 +478,7 @@ class WebPanel:
             import subprocess
             proc = subprocess.run(
                 ["wsl.exe", "--list", "--verbose"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=8,
                 creationflags=0x08000000,
             )
             if proc.returncode == 0:
