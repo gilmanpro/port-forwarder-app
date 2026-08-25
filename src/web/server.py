@@ -472,13 +472,13 @@ class WebPanel:
         }
 
     def distros_list(self) -> dict[str, Any]:
-        """Lista distros WSL via wsl.exe -l -v (sin deteccion de IP: evita colgar)."""
+        """Lista distros WSL via wsl.exe -l -v (timeout corto, sin IP: no cuelga)."""
         distros = []
         try:
             import subprocess
             proc = subprocess.run(
                 ["wsl.exe", "--list", "--verbose"],
-                capture_output=True, text=True, timeout=8,
+                capture_output=True, text=True, timeout=3,
                 creationflags=0x08000000,
             )
             if proc.returncode == 0:
