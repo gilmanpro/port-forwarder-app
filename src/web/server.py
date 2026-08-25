@@ -657,7 +657,41 @@ class WebPanel:
                 store.save()
                 self.supervisor.run_once()
                 return {"ok": True, "message": "mantenimiento OFF"}
+        # Distros WSL: start/stop/restart
+        if (parts[:3] == ["api", "v1", "distro"] and len(parts) == 5
+                and parts[4] in ("start", "stop", "restart")):
+            name, op = parts[3], parts[4]
+            self.metrics.record_event("web_distro_" + op, distro=name)
+            return self._distro_action(name, op)
         return {"ok": False, "error": f"accion desconocida: {path}"}
+
+    def _distro_action(self, name: str, op: str) -> dict[str, Any]:
+        """Ejecuta wsl.exe start/stop/restart sobre una distro (timeout corto)."""
+        import subprocess
+
+        def _run(cmd: list[str], timeout: float = 20) -> tuple[int, str]:
+            try:
+                p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                   creationflags=0x08000000)
+                err = (p.stderr or p.stdout or b"").decode("utf-8", "replace").strip()
+                return p.returncode, err
+            except subprocess.TimeoutExpired:
+                return -1, f"timeout tras {timeout}s"
+
+        verbs = {"start": "iniciada", "stop": "detenida", "restart": "reiniciada"}
+        try:
+            if op == "start":
+                rc, err = _run(["wsl.exe", "-d", name, "--", "true"])
+            elif op == "stop":
+                rc, err = _run(["wsl.exe", "--terminate", name], timeout=15)
+            else:  # restart
+                _run(["wsl.exe", "--terminate", name], timeout=15)
+                rc, err = _run(["wsl.exe", "-d", name, "--", "true"])
+            if rc != 0:
+                return {"ok": False, "error": f"fallo al {op} '{name}': {err or 'error'}"}
+            return {"ok": True, "message": f"distro '{name}' {verbs[op]}"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
 
 
 def start_panel(
@@ -715,7 +749,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             max-height:220px; overflow-y:auto; }
   #events div { padding:3px 0; border-bottom:1px dashed var(--line); }
   #toast { position:fixed; bottom:16px; right:16px; background:#12335f; padding:10px 14px;
-           border-radius:8px; font-size:13px; opacity:0; transition:opacity .3s; }
+           border-radius:8px; font-size:13px; opacity:0; transition:opacity .3s;
+           max-width:360px; box-shadow:0 4px 14px rgba(0,0,0,.4); border-left:4px solid #2563eb; }
+  #toast.ok { border-left-color:var(--ok); }
+  #toast.err { border-left-color:var(--err); }
+  #toast.warn { border-left-color:var(--warn); }
 </style>
 </head>
 <body>
@@ -723,6 +761,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="sub" id="sub">conectando…</div>
 
 <div class="grid">
+  <div class="card">
+    <h2>Distros WSL</h2>
+    <table><thead><tr><th>Distro</th><th>Estado</th><th>Acciones</th></tr></thead>
+    <tbody id="distro-body"></tbody></table>
+  </div>
+
   <div class="card">
     <h2>Forwards (Windows → WSL)</h2>
     <table><thead><tr><th>ID</th><th>Puerto</th><th>Distro</th><th>WSL</th><th>Estado</th></tr></thead>
@@ -811,10 +855,32 @@ function badge(s) {
               (s==='paused'||s==='waiting') ? 'warn' : 'err';
   return '<span class="badge '+cls+'">'+esc(s)+'</span>';
 }
-function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg;
-  t.style.opacity=1; setTimeout(()=>t.style.opacity=0, 2500); }
+function toast(msg, kind){ const t=document.getElementById('toast');
+  t.className = kind ? kind : '';
+  t.textContent=msg; t.style.opacity=1;
+  setTimeout(()=>{t.style.opacity=0; t.className='';}, 4000); }
 async function post(path){ const d = await api(path, {method:'POST'});
-  toast(d.message || d.error || 'ok'); refresh(); }
+  toast(d.message || d.error || 'ok', d.ok===false?'err':'ok'); refresh(); }
+async function postJson(path, body){ const d = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  toast(d.message || d.error || 'ok', d.ok===false?'err':'ok'); refresh(); }
+function distroAction(path, label){
+  toast('Iniciando tarea: '+label+'…', 'warn');
+  post(path).then(()=>{ if(path.includes('/start')) toast('Tarea terminada: '+label); });
+}
+
+function renderDistros(list){
+  const b = document.getElementById('distro-body'); b.innerHTML='';
+  if(!list || !list.length){ b.innerHTML='<tr><td colspan=3 class=muted>sin distros (WSL no responde)</td></tr>'; return; }
+  for(const d of list){
+    const tr=document.createElement('tr');
+    const st = d.state==='Running' ? 'ok' : 'err';
+    tr.innerHTML='<td>'+esc(d.name)+'</td><td>'+badge(st)+'</td>'+
+      '<td><button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/start\',\''+esc(d.name)+'\')">start</button> '+
+      '<button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/stop\',\''+esc(d.name)+'\')">stop</button> '+
+      '<button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/restart\',\''+esc(d.name)+'\')">restart</button></td>';
+    b.appendChild(tr);
+  }
+}
 
 function renderForwards(list){
   const b = document.getElementById('fwd-body'); b.innerHTML='';
@@ -854,10 +920,6 @@ function renderVps(list){
   }
 }
 function val(id){ const el=document.getElementById(id); return el ? el.value.trim() : ''; }
-async function postJson(path, body){
-  const d = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  toast(d.message || d.error || 'ok'); refresh();
-}
 function addForward(){ postJson('/api/v1/forwards/add', {id:val('f-id'), listen_port:+val('f-listen')||0, distro:val('f-distro'), wsl_port:+val('f-wsl')||0, auto_apply:true}); }
 function addTunnel(){ const remotes=val('t-remote').split(',').map(s=>s.trim()).filter(Boolean); postJson('/api/v1/tunnels/add', {id:val('t-id'), vps_id:val('t-vps'), local:val('t-local'), remotes, auto_start:true}); }
 function addVps(){ postJson('/api/v1/vps/add', {id:val('v-id'), host:val('v-host'), user:val('v-user'), password:val('v-pass')}); }
@@ -907,6 +969,8 @@ async function refresh(){
     renderAlerts(d.alerts||[]);
     const v = await api('/api/v1/vps');
     renderVps(v.vps||[]);
+    const ds = await api('/api/v1/distros');
+    renderDistros(ds.distros||[]);
   }catch(e){ document.getElementById('sub').textContent='error: '+e.message; }
 }
 async function refreshEvents(){ try{ const d=await api('/api/v1/events?limit=50'); renderEvents(d.events||[]); }catch(e){} }
