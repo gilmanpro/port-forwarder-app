@@ -512,11 +512,12 @@ class WebPanel:
             import subprocess
             proc = subprocess.run(
                 ["wsl.exe", "--list", "--verbose"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, timeout=3,
                 creationflags=0x08000000,
             )
             if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
+                output = self._decode_wsl(proc.stdout)
+                for line in output.splitlines():
                     line = line.strip()
                     if not line or "NAME" in line.upper() or "---" in line:
                         continue
@@ -535,6 +536,24 @@ class WebPanel:
         except Exception:
             pass
         return {"ok": True, "distros": distros}
+
+    @staticmethod
+    def _decode_wsl(data: bytes) -> str:
+        """Decodifica salida de wsl.exe (UTF-16-LE con/sin BOM)."""
+        if not data:
+            return ""
+        if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+            try:
+                return data.decode("utf-16")
+            except (UnicodeDecodeError, UnicodeError):
+                pass
+        try:
+            s = data.decode("utf-8")
+            if "\x00" in s:
+                return data.decode("utf-16-le", errors="replace")
+            return s
+        except UnicodeDecodeError:
+            return data.decode("utf-16-le", errors="replace")
 
     # -- acciones -------------------------------------------------------------------
 
