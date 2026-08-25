@@ -786,6 +786,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Distros WSL</h2>
     <table><thead><tr><th>Distro</th><th>Estado</th><th>Acciones</th></tr></thead>
     <tbody id="distro-body"></tbody></table>
+    <div class="form"><label>Importar:</label>
+      <input id="imp-name" placeholder="nombre distro" style="width:130px">
+      <input id="imp-file" type="file" accept=".tar">
+      <button onclick="importDistro()">Subir .tar</button></div>
   </div>
 
   <div class="card">
@@ -898,9 +902,43 @@ function renderDistros(list){
     tr.innerHTML='<td>'+esc(d.name)+'</td><td>'+badge(st)+'</td>'+
       '<td><button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/start\',\''+esc(d.name)+'\')">start</button> '+
       '<button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/stop\',\''+esc(d.name)+'\')">stop</button> '+
-      '<button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/restart\',\''+esc(d.name)+'\')">restart</button></td>';
+      '<button onclick="distroAction(\'/api/v1/distro/'+esc(d.name)+'/restart\',\''+esc(d.name)+'\')">restart</button> '+
+      '<button onclick="exportDistro(\''+esc(d.name)+'\')">export</button></td>';
     b.appendChild(tr);
   }
+}
+async function exportDistro(name){
+  toast('Exportando '+name+'…', 'warn');
+  try{
+    const r = await fetch('/api/v1/distro/'+encodeURIComponent(name)+'/export',
+                          {headers:{Authorization:'Bearer '+TOKEN}});
+    if(!r.ok){ const d = await r.json().catch(()=>({})); toast(d.error||'Error al exportar','err'); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name+'.tar';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    toast('Exportacion terminada: '+name, 'ok');
+  }catch(e){ toast('Error: '+e.message, 'err'); }
+}
+async function importDistro(){
+  const file = document.getElementById('imp-file').files[0];
+  const name = val('imp-name');
+  if(!file){ toast('Selecciona un archivo .tar','err'); return; }
+  if(!name){ toast('Pon el nombre de la distro','err'); return; }
+  const fd = new FormData();
+  fd.append('name', name);
+  fd.append('install_dir', '');
+  fd.append('file', file);
+  toast('Importando '+name+'…', 'warn');
+  try{
+    const r = await fetch('/api/v1/distro/import',
+                          {method:'POST', headers:{Authorization:'Bearer '+TOKEN}, body: fd});
+    const d = await r.json();
+    toast(d.message||d.error||'Importada', d.ok===false?'err':'ok');
+    refresh();
+  }catch(e){ toast('Error: '+e.message, 'err'); }
 }
 
 function renderForwards(list){
