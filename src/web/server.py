@@ -521,6 +521,8 @@ class WebPanel:
                     line = line.strip()
                     if not line or "NAME" in line.upper() or "---" in line:
                         continue
+                    if line.startswith("*"):
+                        line = line[1:].strip()
                     parts = [p for p in line.split() if p]
                     if len(parts) >= 3:
                         name, state, ver = parts[0], parts[1], parts[2]
