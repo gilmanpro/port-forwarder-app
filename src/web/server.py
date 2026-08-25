@@ -200,6 +200,23 @@ class PanelHandler(BaseHTTPRequestHandler):
         import tempfile
         import os
 
+        # Pre-check: si WSL no responde en 3s, devolver error rapido
+        try:
+            probe = subprocess.run(
+                ["wsl.exe", "--list", "--verbose"],
+                capture_output=True, timeout=3,
+                creationflags=0x08000000,
+            )
+            if probe.returncode != 0:
+                self._send(*_json({"ok": False, "error": "WSL no responde"}))
+                return
+        except subprocess.TimeoutExpired:
+            self._send(*_json({"ok": False, "error": "WSL no responde (timeout)"}))
+            return
+        except Exception as e:
+            self._send(*_json({"ok": False, "error": str(e)}))
+            return
+
         tmp = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
         tmp_path = tmp.name
         tmp.close()
@@ -244,6 +261,23 @@ class PanelHandler(BaseHTTPRequestHandler):
         import subprocess
         import tempfile
         import os
+
+        # Pre-check: si WSL no responde en 3s, devolver error rapido
+        try:
+            probe = subprocess.run(
+                ["wsl.exe", "--list", "--verbose"],
+                capture_output=True, timeout=3,
+                creationflags=0x08000000,
+            )
+            if probe.returncode != 0:
+                self._send(*_json({"ok": False, "error": "WSL no responde"}))
+                return
+        except subprocess.TimeoutExpired:
+            self._send(*_json({"ok": False, "error": "WSL no responde (timeout)"}))
+            return
+        except Exception as e:
+            self._send(*_json({"ok": False, "error": str(e)}))
+            return
 
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
