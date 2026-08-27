@@ -47,6 +47,62 @@ log = logging.getLogger("port-forwarder.web")
 DEFAULT_PORT = 8794
 DEFAULT_BIND = "127.0.0.1"
 
+# Rate limiting para login (igual que MCP): 5 intentos fallidos -> bloqueo 15 min
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW = 300  # ventana de conteo (5 min)
+LOGIN_BLOCK_TIME = 900  # bloqueo tras exceder (15 min)
+
+
+class RateLimiter:
+    """Contador por IP con ventana deslizante y bloqueo temporal (thread-safe)."""
+
+    def __init__(self, max_attempts: int = LOGIN_MAX_ATTEMPTS,
+                 window: float = LOGIN_WINDOW, block_time: float = LOGIN_BLOCK_TIME) -> None:
+        self.max_attempts = max_attempts
+        self.window = window
+        self.block_time = block_time
+        self._attempts: dict[str, list[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def is_blocked(self, key: str) -> tuple[bool, float]:
+        now = time.time()
+        with self._lock:
+            until = self._blocked_until.get(key, 0)
+            if now < until:
+                return True, until - now
+            # limpiar bloqueo expirado
+            if key in self._blocked_until and now >= until:
+                del self._blocked_until[key]
+                self._attempts.pop(key, None)
+            # limpiar intentos fuera de ventana
+            lst = self._attempts.get(key, [])
+            lst = [t for t in lst if now - t < self.window]
+            self._attempts[key] = lst
+            return False, 0
+
+    def record_failure(self, key: str) -> None:
+        now = time.time()
+        with self._lock:
+            lst = self._attempts.setdefault(key, [])
+            lst.append(now)
+            lst[:] = [t for t in lst if now - t < self.window]
+            if len(lst) > self.max_attempts:
+                self._blocked_until[key] = now + self.block_time
+                log.warning("rate limit: %s bloqueado %.0fs tras %d fallos", key, self.block_time, len(lst))
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._attempts.pop(key, None)
+            self._blocked_until.pop(key, None)
+
+    def remaining(self, key: str) -> int:
+        with self._lock:
+            lst = self._attempts.get(key, [])
+            now = time.time()
+            lst = [t for t in lst if now - t < self.window]
+            return max(0, self.max_attempts - len(lst))
+
 
 def _json(data: Any) -> tuple[bytes, int]:
     body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
@@ -114,6 +170,72 @@ class PanelHandler(BaseHTTPRequestHandler):
         self._send(json.dumps({"ok": False, "error": msg},
                               ensure_ascii=False).encode("utf-8"), status)
 
+    def _client_ip(self) -> str:
+        try:
+            return self.client_address[0] if self.client_address else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _rate_limited(self) -> bool:
+        """Si el IP esta bloqueado, responde 429 y devuelve True."""
+        blocked, remaining = self.panel.rate_limiter.is_blocked(self._client_ip())
+        if blocked:
+            body = json.dumps(
+                {"ok": False, "error": f"demasiados intentos, espera {int(remaining)}s"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", str(int(remaining)))
+            self.send_header("X-RateLimit-Remaining", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        return False
+
+    def _handle_login(self) -> None:
+        """POST /api/v1/login — valida token con rate limiting."""
+        if self._rate_limited():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            raw = self.rfile.read(length) if length else b""
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        except (ValueError, json.JSONDecodeError):
+            self._deny(400, "body JSON invalido")
+            return
+        token = str(body.get("token") or body.get("password") or "").strip()
+        ip = self._client_ip()
+        if token and token == self.panel.token:
+            self.panel.rate_limiter.record_success(ip)
+            self._send(*_json({"ok": True, "message": "login correcto"}))
+            log.info("login ok desde %s", ip)
+        else:
+            self.panel.rate_limiter.record_failure(ip)
+            blocked, remaining = self.panel.rate_limiter.is_blocked(ip)
+            if blocked:
+                body_b, _ = _json({"ok": False, "error": f"demasiados intentos, espera {int(remaining)}s"})
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_b)))
+                self.send_header("Retry-After", str(int(remaining)))
+                self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body_b)
+            else:
+                remaining = self.panel.rate_limiter.remaining(ip)
+                body_b, _ = _json({"ok": False, "error": "token invalido"})
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_b)))
+                self.send_header("X-RateLimit-Remaining", str(remaining))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body_b)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         log.debug(fmt, *args)
 
@@ -122,6 +244,9 @@ class PanelHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/login":
+            self._send(LOGIN_HTML, 200, "text/html")
+            return
         if path == "/":
             self._send(self.panel.dashboard_html, 200, "text/html")
             return
@@ -129,8 +254,33 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._deny(404, "no encontrado")
             return
         if not self._authed():
-            self._deny()
+            if self._rate_limited():
+                return
+            self.panel.rate_limiter.record_failure(self._client_ip())
+            blocked, remaining = self.panel.rate_limiter.is_blocked(self._client_ip())
+            if blocked:
+                body, _ = _json({"ok": False, "error": f"demasiados intentos, espera {int(remaining)}s"})
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Retry-After", str(int(remaining)))
+                self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            remaining = self.panel.rate_limiter.remaining(self._client_ip())
+            body, _ = _json({"ok": False, "error": "no autorizado"})
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-RateLimit-Remaining", str(remaining))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
+        # exito: limpiar contador
+        self.panel.rate_limiter.record_success(self._client_ip())
         try:
             if path == "/api/v1/state":
                 self._send(*_json(self.panel.state()))
@@ -164,12 +314,40 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             self._deny(404, "no encontrado")
             return
+        # Login no requiere auth previa (es el login mismo)
+        if path == "/api/v1/login":
+            self._handle_login()
+            return
         if not self._csrf_ok():
             self._deny(403, "origen no permitido (CSRF)")
             return
         if not self._authed():
-            self._deny()
+            if self._rate_limited():
+                return
+            self.panel.rate_limiter.record_failure(self._client_ip())
+            blocked, remaining = self.panel.rate_limiter.is_blocked(self._client_ip())
+            if blocked:
+                body, _ = _json({"ok": False, "error": f"demasiados intentos, espera {int(remaining)}s"})
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Retry-After", str(int(remaining)))
+                self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            remaining = self.panel.rate_limiter.remaining(self._client_ip())
+            body, _ = _json({"ok": False, "error": "no autorizado"})
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-RateLimit-Remaining", str(remaining))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
+        self.panel.rate_limiter.record_success(self._client_ip())
 
         # Import distro (multipart upload)
         if path == "/api/v1/distro/import":
@@ -386,6 +564,7 @@ class WebPanel:
         self.token = token
         self.metrics = metrics or supervisor.metrics
         self.dashboard_html = dashboard_html or DASHBOARD_HTML
+        self.rate_limiter = RateLimiter()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.running = False
@@ -873,6 +1052,11 @@ async function api(path, opts={}) {
   if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
   const r = await fetch(path, Object.assign({headers}, opts));
   if (r.status === 401) { TOKEN=''; localStorage.removeItem('pf_token'); askToken(); }
+  if (r.status === 429) {
+    const d = await r.clone().json().catch(()=>({}));
+    toast(d.error || 'Demasiados intentos, espera un momento', 'err');
+    throw new Error(d.error || 'Rate limited');
+  }
   return r.json();
 }
 function badge(s) {
@@ -1036,6 +1220,82 @@ async function refreshEvents(){ try{ const d=await api('/api/v1/events?limit=50'
 refresh(); refreshEvents();
 setInterval(refresh, 3000);
 setInterval(refreshEvents, 5000);
+</script>
+</body>
+</html>
+"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login - Port Forwarding Manager</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a212b; --line:#2b3644; --text:#d7e0ea; --muted:#7d8ca1; --ok:#34c759; --err:#ff453a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,sans-serif; background:var(--bg); color:var(--text);
+         display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:24px; width:100%; max-width:380px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  input { width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--text); font-size:14px; margin-bottom:12px; }
+  button { width:100%; background:#2563eb; border:0; color:#fff; padding:8px 12px; border-radius:6px; cursor:pointer; font-size:14px; }
+  button:hover { filter:brightness(1.15); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #msg { font-size:13px; margin-top:10px; min-height:18px; }
+  #msg.err { color:var(--err); }
+  #msg.ok { color:var(--ok); }
+  #msg.warn { color:var(--warn); }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Port Forwarding Manager</h1>
+  <div class="sub">Introduce el token del panel web</div>
+  <input id="token" type="password" placeholder="Token" autocomplete="current-password">
+  <button id="btn" onclick="doLogin()">Entrar</button>
+  <div id="msg"></div>
+</div>
+<script>
+function setMsg(text, cls){
+  const el=document.getElementById('msg');
+  el.textContent=text;
+  el.className=cls||'';
+}
+async function doLogin(){
+  const token=document.getElementById('token').value.trim();
+  if(!token){ setMsg('Introduce el token','err'); return; }
+  const btn=document.getElementById('btn');
+  btn.disabled=true;
+  setMsg('Verificando...','');
+  try{
+    const r=await fetch('/api/v1/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token})});
+    const d=await r.json();
+    if(r.status===429){
+      setMsg(d.error||'Demasiados intentos, espera','err');
+      const retry=r.headers.get('Retry-After');
+      if(retry) setMsg('Bloqueado '+retry+'s por demasiados intentos','err');
+      btn.disabled=false;
+      return;
+    }
+    if(!r.ok || !d.ok){
+      const remaining=r.headers.get('X-RateLimit-Remaining');
+      let msg=d.error||'Token invalido';
+      if(remaining!==null) msg+=' ('+remaining+' intentos restantes)';
+      setMsg(msg,'err');
+      btn.disabled=false;
+      return;
+    }
+    localStorage.setItem('pf_token', token);
+    setMsg('Login correcto, redirigiendo...','ok');
+    setTimeout(()=>{ window.location.href='/'; }, 600);
+  }catch(e){
+    setMsg('Error: '+e.message,'err');
+    btn.disabled=false;
+  }
+}
+document.getElementById('token').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
 </script>
 </body>
 </html>

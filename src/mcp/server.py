@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
 from typing import Any, Callable
 
 from src import __version__
@@ -23,6 +25,51 @@ from src.api.service import AppService
 log = logging.getLogger("port-forwarder.mcp")
 
 PROTOCOL_VERSION = "2024-11-05"
+
+# Rate limiting igual que panel web: 5 fallos -> bloqueo 15 min
+MCP_MAX_ATTEMPTS = 5
+MCP_WINDOW = 300
+MCP_BLOCK_TIME = 900
+
+
+class RateLimiter:
+    def __init__(self, max_attempts: int = MCP_MAX_ATTEMPTS,
+                 window: float = MCP_WINDOW, block_time: float = MCP_BLOCK_TIME) -> None:
+        self.max_attempts = max_attempts
+        self.window = window
+        self.block_time = block_time
+        self._attempts: dict[str, list[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def is_blocked(self, key: str) -> tuple[bool, float]:
+        now = time.time()
+        with self._lock:
+            until = self._blocked_until.get(key, 0)
+            if now < until:
+                return True, until - now
+            if key in self._blocked_until and now >= until:
+                del self._blocked_until[key]
+                self._attempts.pop(key, None)
+            lst = self._attempts.get(key, [])
+            lst = [t for t in lst if now - t < self.window]
+            self._attempts[key] = lst
+            return False, 0
+
+    def record_failure(self, key: str) -> None:
+        now = time.time()
+        with self._lock:
+            lst = self._attempts.setdefault(key, [])
+            lst.append(now)
+            lst[:] = [t for t in lst if now - t < self.window]
+            if len(lst) > self.max_attempts:
+                self._blocked_until[key] = now + self.block_time
+                log.warning("mcp rate limit: %s bloqueado %.0fs tras %d fallos", key, self.block_time, len(lst))
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._attempts.pop(key, None)
+            self._blocked_until.pop(key, None)
 
 ToolFn = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -153,6 +200,7 @@ class McpServer:
         self.tools = tools if tools is not None else build_tools(self.service)
         self.token = token if token is not None \
             else os.environ.get("PORT_FORWARDER_TOKEN") or ""
+        self.rate_limiter = RateLimiter()
 
     # -- protocolo -----------------------------------------------------------------
 
@@ -185,11 +233,21 @@ class McpServer:
             name = params.get("name", "")
             arguments = params.get("arguments") or {}
             if self.token:
+                blocked, remaining = self.rate_limiter.is_blocked("mcp")
+                if blocked:
+                    return self._error(msg_id, -32001,
+                                       f"demasiados intentos, espera {int(remaining)}s")
                 provided = arguments.get("token") or \
                     (arguments.get("_meta") or {}).get("token")
                 if provided != self.token:
+                    self.rate_limiter.record_failure("mcp")
+                    blocked, remaining = self.rate_limiter.is_blocked("mcp")
+                    if blocked:
+                        return self._error(msg_id, -32001,
+                                           f"demasiados intentos, espera {int(remaining)}s")
                     return self._error(msg_id, -32001,
                                        "token invalido (PORT_FORWARDER_TOKEN)")
+                self.rate_limiter.record_success("mcp")
             tool = next((t for t in self.tools if t["name"] == name), None)
             if tool is None:
                 return self._error(msg_id, -32602, f"tool desconocida: {name}")
