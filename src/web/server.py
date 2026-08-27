@@ -258,8 +258,10 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def _ws_handshake(self) -> socket.socket | None:
         """Upgrade a WebSocket si el cliente lo pide. Devuelve el socket crudo o None."""
+        log.info("WS handshake desde %s path=%s", self._client_ip(), self.path)
         key = self.headers.get("Sec-WebSocket-Key", "")
         if not key:
+            log.warning("WS sin Sec-WebSocket-Key")
             return None
         # Validar token via query ?token= o cookie
         qs = parse_qs(urlparse(self.path).query)
