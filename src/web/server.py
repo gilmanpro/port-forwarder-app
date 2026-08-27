@@ -164,7 +164,13 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not token:
             return True
         auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {token}"
+        if auth == f"Bearer {token}":
+            return True
+        # Tambien aceptar cookie de sesion (login via /login)
+        cookie = self.headers.get("Cookie", "")
+        if f"pf_token={token}" in cookie:
+            return True
+        return False
 
     def _deny(self, status: int = 401, msg: str = "no autorizado") -> None:
         self._send(json.dumps({"ok": False, "error": msg},
@@ -210,8 +216,17 @@ class PanelHandler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         if token and token == self.panel.token:
             self.panel.rate_limiter.record_success(ip)
-            self._send(*_json({"ok": True, "message": "login correcto"}))
+            body_b, _ = _json({"ok": True, "message": "login correcto"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body_b)))
+            # Cookie de sesion para que GET / funcione sin Bearer header
+            self.send_header("Set-Cookie", f"pf_token={token}; Path=/; HttpOnly; SameSite=Lax")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body_b)
             log.info("login ok desde %s", ip)
+            return
         else:
             self.panel.rate_limiter.record_failure(ip)
             blocked, remaining = self.panel.rate_limiter.is_blocked(ip)
@@ -248,6 +263,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(LOGIN_HTML, 200, "text/html")
             return
         if path == "/":
+            if self.panel.token and not self._authed():
+                self._send(LOGIN_HTML, 200, "text/html")
+                return
             self._send(self.panel.dashboard_html, 200, "text/html")
             return
         if not path.startswith("/api/"):
@@ -1035,23 +1053,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 let TOKEN = localStorage.getItem('pf_token') || '';
-if (!TOKEN) askToken();
-
 // Escape XSS (H2): toda interpolacion a innerHTML pasa por esc().
 function esc(v){ const d=document.createElement('div');
   d.textContent = (v===null||v===undefined) ? '' : String(v);
   return d.innerHTML; }
 
-function askToken() {
-  const t = prompt('Token del panel web:');
-  if (t) { TOKEN = t; localStorage.setItem('pf_token', t); }
   else TOKEN = '';
 }
 async function api(path, opts={}) {
   const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
   if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
   const r = await fetch(path, Object.assign({headers}, opts));
-  if (r.status === 401) { TOKEN=''; localStorage.removeItem('pf_token'); askToken(); }
+  if (r.status === 401) {
+    window.location.href = '/login';
+    throw new Error('No autorizado');
+  }
   if (r.status === 429) {
     const d = await r.clone().json().catch(()=>({}));
     toast(d.error || 'Demasiados intentos, espera un momento', 'err');
