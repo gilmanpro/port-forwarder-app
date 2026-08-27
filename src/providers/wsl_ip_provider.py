@@ -26,8 +26,8 @@ class WslIpProvider:
     def __init__(
         self,
         wsl_exe: str | None = None,
-        cache_ttl: float = 5.0,
-        timeout: float = 30.0,
+        cache_ttl: float = 30.0,
+        timeout: float = 8.0,
     ) -> None:
         import sys as _sys
 
@@ -50,6 +50,7 @@ class WslIpProvider:
                 [self.wsl_exe, "-d", distro, "hostname", "-I"],
                 timeout=self.timeout,
                 check=False,
+                breaker=False,  # sondeo IP no fatal: no abre cortocircuito
             )
         except (OSError, subprocess.TimeoutExpired):
             self._cache[distro] = (now, None)

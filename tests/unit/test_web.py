@@ -156,10 +156,11 @@ def test_post_forwards_apply(panel, env):
     sup.run_once.assert_called()
 
 
-def test_csrf_rejects_without_origin(panel):
+def test_csrf_allows_without_origin_for_api(panel):
+    # Sin Origin/Referer = no es navegador (curl/script) -> permitir (auth sigue obligatoria)
     status, data = _post(panel, "/api/v1/forwards/apply", origin=None)
-    assert status == 403
-    assert "CSRF" in data["error"] or "origen" in data["error"]
+    assert status == 200
+    assert data["ok"] is True
 
 
 def test_csrf_rejects_evil_origin(panel):
