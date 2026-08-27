@@ -2,17 +2,31 @@
 #   docker compose up -d
 # La clave del panel se define con:  PF_WEB_TOKEN=mi-clave docker compose up -d
 # (si no se define, el entrypoint genera una y la muestra en los logs)
+#
+# Reenvio en Linux/Docker:
+#   - Puertos privilegiados (<1024) requieren cap_add NET_ADMIN.
+#   - Para reenvio real host->contenedor/app, usa network_mode: host
+#     o publica cada listen_port en 'ports:'.
 services:
   port-forwarder:
     build: .
     image: port-forwarder:latest
     container_name: port-forwarder
     restart: unless-stopped
+    # Reenvio con socat en Linux/Docker: sin NET_ADMIN falla en <1024 y sin host
+    # no puede bindear puertos del host. Descomenta segun necesites:
+    # network_mode: host          # <-- reenvio directo en red del host (Linux)
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     environment:
       - PORT_FORWARDER_WEB_TOKEN=${PF_WEB_TOKEN:-}
     ports:
       - "8794:8794"   # panel web (protegido con clave)
       - "8795:8795"   # API REST (si la activas en config)
+      # Ejemplo: publica tus forwards (o usa network_mode: host)
+      # - "8080:8080"
+      # - "3000:3000"
     volumes:
       - pf-data:/data
       # Opcional: tus claves SSH para los tuneles hacia VPS

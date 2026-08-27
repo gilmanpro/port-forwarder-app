@@ -3,9 +3,15 @@
 # El contenedor corre el panel web + supervisor (tuneles SSH hacia VPS).
 FROM python:3.11-slim
 
-# ssh para los tuneles SSH hacia VPS (necesario; la app lo usa)
+# ssh para tuneles + socat/iptables para reenvio en Linux
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-client \
+ && apt-get install -y --no-install-recommends \
+        openssh-client \
+        socat \
+        iproute2 \
+        procps \
+        net-tools \
+        iptables \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

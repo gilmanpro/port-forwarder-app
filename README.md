@@ -80,8 +80,12 @@
 
 El **core es multiplataforma** (Python 3.11+): panel web, supervisor, túneles SSH,
 API REST, MCP, programador, perfiles, alertas y CLI funcionan en Linux y macOS
-sin dependencias externas. Solo los **forwards Windows→WSL** (`netsh portproxy` +
-firewall) son exclusivos de Windows.
+sin dependencias externas. Los **forwards** funcionan en **Windows** (`netsh portproxy`
++ firewall) y en **Linux/Docker** (`socat` TCP-LISTEN → destino).
+
+> **Reenvío en Linux/Docker:** requiere `socat` (`apt-get install socat`). En Docker
+> la imagen ya lo trae. Para puertos <1024 y reenvío host real, el contenedor
+> necesita `cap_add: [NET_ADMIN, NET_RAW]` y/o `network_mode: host` (ver `docker-compose.yml`).
 
 ### Ejecutar en Linux (sin contenedor)
 

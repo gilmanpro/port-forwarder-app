@@ -27,6 +27,7 @@ from src.core.notifier import notify
 from src.providers import (
     cloudflare_provider,
     netsh_provider,
+    socat_provider,
     ssh_tunnel_provider,
     tailscale_provider,
     wsl_ip_provider,
@@ -60,7 +61,16 @@ class Supervisor:
         web_panel_external: bool = False,
     ) -> None:
         self.store = store
-        self.netsh = netsh or netsh_provider.NetshProvider()
+        # Forward provider segun plataforma: netsh (Windows) o socat (Linux/Docker)
+        if netsh is not None:
+            self.netsh = netsh
+        else:
+            import sys as _sys
+
+            if _sys.platform == "win32":
+                self.netsh = netsh_provider.NetshProvider()
+            else:
+                self.netsh = socat_provider.SocatProvider()
         self.wsl = wsl or wsl_ip_provider.WslIpProvider()
         self.ssh = ssh or ssh_tunnel_provider.SshTunnelProvider()
         self.tailscale = tailscale or tailscale_provider.TailscaleProvider()
