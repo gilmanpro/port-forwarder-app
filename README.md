@@ -7,7 +7,15 @@
 
 > Gestión de **redirección de puertos Windows → WSL** (netsh portproxy + firewall) y **túneles SSH hacia VPS**, con supervisor automático, health checks, alertas, programador, perfiles, panel web y CLI completo con **paridad garantizada** con la GUI.
 
-**Proyecto hermano:** [wsl-manager-gui](https://github.com/gilbertomanc/wsl-manager-gui) — gestión de distros WSL2. Ambas apps son **independientes y coexisten** en la misma máquina: port-forwarder usa puertos propios (8794/8795/8796) y no necesita que wsl-manager esté instalado.
+### Ecosistema
+
+| Repositorio | Descripción |
+|---|---|
+| **[wsl-port](https://github.com/gilmanpro/wsl-port)** | ⭐ **App unificada** — WSL Manager + Port Forwarder en 1 clic (recomendada) |
+| [wsl-manager-gui](https://github.com/gilmanpro/wsl-manager-gui) | Base de gestión WSL — vendored en wsl-port |
+| **port-forwarder-app** (este repo) | Base de port forwarding — vendored en wsl-port |
+
+> **Recomendado:** usa **[wsl-port](https://github.com/gilmanpro/wsl-port)** que unifica ambas bases. Este repo sigue siendo útil de forma independiente y coexiste con wsl-manager-gui (puertos propios).
 
 ---
 
@@ -112,7 +120,7 @@ docker compose up -d
 
 ```powershell
 # Desde el repo:
-git clone https://github.com/gilbertomanc/port-forwarder-app
+git clone https://github.com/gilmanpro/port-forwarder-app
 cd port-forwarder-app
 python -m venv .venv
 .venv\Scripts\activate
@@ -339,7 +347,7 @@ Pasos para quitar **toda** huella de la app en Windows. Ejecuta en PowerShell
 4. Envía un pull request describiendo el cambio.
 
 Reporta bugs o pide funciones en
-[Issues](https://github.com/gilbertomanc/port-forwarder-app/issues).
+[Issues](https://github.com/gilmanpro/port-forwarder-app/issues).
 
 ## Licencia
 
